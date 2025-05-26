@@ -46,9 +46,11 @@ func (db *orderRepository) CreateOrder(order entity.OrderCreate) entity.OrderCre
 	//order.RunNo = db.GetLastNo(order.CompanyId, order.BranchId, order.RouteId, order.RouteCode)
 	var data []entity.OrderLineStruct = order.DataList
 	var order_master entity.OrderMaster
+        var order_no_new = db.GetLastNo(order.CompanyId, order.BranchId, order.RouteId, order.RouteCode)
 	//var order_total_amt float64 = 0
 
-	order_master.OrderNo = order.OrderNo
+	//order_master.OrderNo = order.OrderNo
+	order_master.OrderNo = order_no_new
 	order_master.OrderDate = time.Now()
 	order_master.CustomerId = 0
 	order_master.OrderChannelId = int64(order.RouteId)
@@ -490,9 +492,9 @@ func (db *orderRepository) CloseOrder(order entity.OrderClose) int {
 		params.Add("branch_id", strconv.Itoa(int(order.BranchId)))
 		params.Add("user_id", strconv.Itoa(int(order.UserId)))
 
-		resp, err := http.PostForm("http://141.98.19.240/icesystem/frontend/web/api/order/createnotifyclose", params) // NKY
+		//resp, err := http.PostForm("http://141.98.19.240/icesystem/frontend/web/api/order/createnotifyclose", params) // NKY
 		//resp, err := http.PostForm("http://103.253.73.108/icesystem/frontend/web/api/order/createnotifyclose", params) // NKY
-		//resp, err := http.PostForm("http://141.98.16.4/icesystem/frontend/web/api/order/createnotifyclose", params) // BKT
+		resp, err := http.PostForm("http://103.13.28.31/icesystem/frontend/web/api/order/createnotifyclose", params) // BKT
 		if err != nil {
 			panic("api error")
 		}

@@ -10,10 +10,10 @@ import (
 var (
 	// dbUserMysql = "cicuser"
 	// dbPassMysql = "Ax12345678"
-	dbUserMysql = "root"
-	dbPassMysql = ""
+	dbUserMysql = "admin_root"
+	dbPassMysql = "ofXiCHCg8D"
 
-	db = [2]string{"localhost", "vorapat"}
+	db = [2]string{"localhost", "admin_icesystem"}
 	//db = [2]string{"192.168.60.189", "cicsupport"}
 	//db = [2]string{"192.168.1.104", "cicsupport"}
 
