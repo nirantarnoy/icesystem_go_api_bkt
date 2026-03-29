@@ -294,49 +294,7 @@ func (db *orderRepository) AddPayment(order_id uint64, customer_id uint64, amoun
 	var new_file = ""
 	var is_cash_transfer_payment = 1; // 1 cash, 2 transfer
 
-	if image != "" {
-		print("has photo");
-		var z = 0
-		//var ostypename = "http://192.168.60.191/icesystem/backend/web/uploads/"
-
-		// The path to the image you want to upload
-		imagePath := "/var/www/html/icesystem/backend/web/uploads/files/receive/"
-
-		//fmt.Println(i, s)
-		z += 1
-		y := fmt.Sprintf("%v", z)
-
-		var b64 = image
-		dc, err := base64.StdEncoding.DecodeString(b64)
-		if err != nil {
-			panic(err)
-		}
-		new_file = strconv.FormatInt(time.Now().Unix(), 20) + y + ".jpg"
-
-		//f, err := os.Create("http://172.16.0.29/cicsupport/backend/web/uploads/myfilename.jpg")
-		f, err := os.OpenFile(imagePath+new_file, os.O_WRONLY|os.O_CREATE, 0777) //administrator@172.16.0.240/uploads
-		if err != nil {
-			panic(err);
-			print("create file error");
-		}
-		//ostype := runtime.GOOS
-
-		//log.Print(ostype)
-
-		// f, err := os.OpenFile(ostypename+new_file, os.O_WRONLY|os.O_CREATE, 0777) //administrator@172.16.0.240/uploads
-		// if err != nil {
-		// 	panic(err)
-		// }
-
-		if _, err := f.Write(dc); err != nil {
-			panic(err)
-		}
-
-		defer f.Close()
-
-		go sendFileToPHPServer(new_file)
-
-	}
+	// Removed redundant file saving logic as it's now handled by UpdatePhoto
 
 	var payment = entity.PaymentMaster{
 		Id:         0,
@@ -356,10 +314,30 @@ func (db *orderRepository) AddPayment(order_id uint64, customer_id uint64, amoun
 	if payment.JournalNo != "error na ja" {
 		res := db.connect.Table("payment_receive").Create(&payment)
 		if res.Error == nil {
+			log.Printf("✅ [AddPayment] create payment master record success (id: %d)", payment.Id)
+			if image != "" {
+				log.Println("📸 [AddPayment] found image in order, starting UpdatePhoto...")
+				userRepo := &UserConnect{connect: db.connect}
+				slipDoc := entity.SlipDoc{
+					Image: []string{image},
+				}
+				fileNameGenerated, err := userRepo.UpdatePhoto(slipDoc, payment.Id)
+				if err == nil && fileNameGenerated != "" {
+					log.Printf("📥 [AddPayment] UpdatePhoto success: %s", fileNameGenerated)
+					go sendFileToPHPServer(fileNameGenerated)
+				} else {
+					log.Printf("❌ [AddPayment] UpdatePhoto failed: %v", err)
+				}
+			}
+
 			res_save_detail := db.connect.Table("payment_receive_line").Create(map[string]interface{}{"payment_receive_id": payment.Id, "order_id": order_id, "payment_amount": pay_amount, "payment_channel_id": is_cash_transfer_payment, "payment_method_id": payment_type_id, "status": 1, "payment_type_id": payment_type_id})
 			if res_save_detail.Error == nil {
-				print("create payment")
+				log.Printf("✅ [AddPayment] create payment detail record success")
+			} else {
+				log.Printf("❌ [AddPayment] create payment detail record failed: %v", res_save_detail.Error)
 			}
+		} else {
+			log.Printf("❌ [AddPayment] create payment master record failed: %v", res.Error)
 		}
 	}
 
@@ -414,15 +392,20 @@ func (db *orderRepository) AddPayment(order_id uint64, customer_id uint64, amoun
 }
 
 func sendFileToPHPServer(filename string) {
+	log.Printf("🚀 [Sync] Starting file upload to PHP server: %s", filename)
+
 	// 📁 Path ไฟล์จริงที่เพิ่งบันทึกไว้
 	filePath := filepath.Join("/var/www/html/icesystem/backend/web/uploads/files/receive/", filename)
 
 	file, err := os.Open(filePath)
 	if err != nil {
-		fmt.Println("❌ Error opening file:", err)
+		log.Printf("❌ [Sync] Error opening file: %v", err)
 		return
 	}
 	defer file.Close()
+
+	fileInfo, _ := file.Stat()
+	log.Printf("📦 [Sync] File size: %d bytes", fileInfo.Size())
 
 	// 🧩 สร้าง multipart form
 	body := &bytes.Buffer{}
@@ -431,13 +414,13 @@ func sendFileToPHPServer(filename string) {
 	// form field name ต้องตรงกับ PHP ($_FILES['image'])
 	part, err := writer.CreateFormFile("image", filepath.Base(filename))
 	if err != nil {
-		fmt.Println("❌ Error creating form file:", err)
+		log.Printf("❌ [Sync] Error creating form file: %v", err)
 		return
 	}
 
 	// คัดลอกข้อมูลไฟล์ใส่ body
 	if _, err = io.Copy(part, file); err != nil {
-		fmt.Println("❌ Error copying file:", err)
+		log.Printf("❌ [Sync] Error copying file to buffer: %v", err)
 		return
 	}
 
@@ -449,17 +432,21 @@ func sendFileToPHPServer(filename string) {
 
 	// 🌐 ส่งไฟล์ไปยัง PHP endpoint
 	uploadURL := remoteServerHost + "/icesystem/backend/web/index.php?r=site/uploadfromgo"
+	log.Printf("🌐 [Sync] Uploading to: %s", uploadURL)
+
 	req, err := http.NewRequest("POST", uploadURL, body)
 	if err != nil {
-		fmt.Println("❌ Error creating request:", err)
+		log.Printf("❌ [Sync] Error creating request: %v", err)
 		return
 	}
 	req.Header.Set("Content-Type", writer.FormDataContentType())
 
-	client := &http.Client{}
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+	}
 	resp, err := client.Do(req)
 	if err != nil {
-		fmt.Println("❌ Error sending request:", err)
+		log.Printf("❌ [Sync] Error sending request: %v", err)
 		return
 	}
 	defer resp.Body.Close()
@@ -467,11 +454,12 @@ func sendFileToPHPServer(filename string) {
 	// ✅ ตรวจสอบ response
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("⚠️ PHP server responded: %s\n%s\n", resp.Status, string(respBody))
+		log.Printf("⚠️ [Sync] PHP server responded with status: %s", resp.Status)
+		log.Printf("📄 [Sync] Response body: %s", string(respBody))
 		return
 	}
 
-	fmt.Println("✅ File sent to PHP server successfully")
+	log.Printf("✅ [Sync] File %s sent to PHP server successfully", filename)
 }
 
 
@@ -1097,52 +1085,50 @@ func (db *orderRepository) GetReturnLastNo(company_id uint64, branch_id uint64) 
 	return prefix
 }
 
-func (db *UserConnect) UpdatePhoto(photo entity.SlipDoc, payment_id uint64) bool {
-	//	 var photo []
-	//var id int
-
+func (db *UserConnect) UpdatePhoto(photo entity.SlipDoc, payment_id uint64) (string, error) {
 	var z = 0
-	var ostypename = ""
-	var new_file = ""
+	imagePath := "/var/www/html/icesystem/backend/web/uploads/files/receive/"
+	var fileNameGenerated = ""
+
 	for _, s := range photo.Image {
-		//fmt.Println(i, s)
 		z += 1
 		y := fmt.Sprintf("%v", z)
 
-		var b64 = s
-		dc, err := base64.StdEncoding.DecodeString(b64)
+		dc, err := base64.StdEncoding.DecodeString(s)
 		if err != nil {
-			panic(err)
-		}
-		new_file = strconv.FormatInt(time.Now().Unix(), 20) + y + ".jpg"
-
-		//f, err := os.Create("http://172.16.0.29/cicsupport/backend/web/uploads/myfilename.jpg")
-
-		ostype := runtime.GOOS
-
-		log.Print(ostype)
-
-		f, err := os.OpenFile(ostypename+new_file, os.O_WRONLY|os.O_CREATE, 0777) //administrator@172.16.0.240/uploads
-		if err != nil {
-			panic(err)
+			log.Printf("❌ [UpdatePhoto] decode error: %v", err)
+			return "", err
 		}
 
-		defer f.Close()
+		fileNameGenerated = strconv.FormatInt(time.Now().Unix(), 20) + y + ".jpg"
+		fullName := imagePath + fileNameGenerated
+
+		f, err := os.OpenFile(fullName, os.O_WRONLY|os.O_CREATE, 0777)
+		if err != nil {
+			log.Printf("❌ [UpdatePhoto] open file error: %v", err)
+			return "", err
+		}
 
 		if _, err := f.Write(dc); err != nil {
-			panic(err)
+			f.Close()
+			log.Printf("❌ [UpdatePhoto] write file error: %v", err)
+			return "", err
+		}
+		f.Close()
+
+		log.Printf("💾 [UpdatePhoto] file saved: %s", fullName)
+
+		result := db.connect.Table("payment_receive").Where("id = ?", payment_id).Updates(map[string]interface{}{"slip_doc": fileNameGenerated})
+		if result.Error != nil {
+			log.Printf("❌ [UpdatePhoto] update db error: %v", result.Error)
+			return "", result.Error
 		}
 
-		result := db.connect.Table("payment_receive").Where("id = ?", payment_id).Updates(map[string]interface{}{"slip_doc": new_file})
-		// result := db.connect.Table("person").Updates(map[string]interface{}{"photo": new_file})
-		if result.RowsAffected > 0 {
-			return true
-		} else {
-			return false
-		}
+		log.Printf("✅ [UpdatePhoto] database updated for payment_id: %d with filename: %s", payment_id, fileNameGenerated)
 
+		return fileNameGenerated, nil // return on first image as per original logic
 	}
-	return true
+	return "", nil
 }
 
 func NewOrderRepository(db *gorm.DB) OrderRepository {
