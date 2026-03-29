@@ -1,17 +1,8 @@
 package repository
 
 import (
-	"bytes"
-	"encoding/base64"
-	"fmt"
-	"io"
-	"log"
-	"mime/multipart"
 	"net/http"
 	"net/url"
-	"os"
-	"path/filepath"
-	"runtime"
 	"strconv"
 	"time"
 
@@ -19,21 +10,19 @@ import (
 	"tarlek.com/icesystem/entity"
 )
 
-const remoteServerHost = "http://141.98.19.240"
-
-type OrderRepository interface {
+type OrderRepositoryOld interface {
 	CreateOrder(order entity.OrderCreate) entity.OrderCreate
 	CloseOrder(order entity.OrderClose) int
 	GetLastNo(company_id uint64, branch_id uint64, route_id uint64, route_code string) string
 	CustomerOrder(customerOrder entity.OrderCustomer) entity.OrderList
 }
 
-type orderRepository struct {
+type orderRepositoryOld struct {
 	connect *gorm.DB
 }
 
 // CustomerOrder implements OrderRepository
-func (db *orderRepository) CustomerOrder(customerOrder entity.OrderCustomer) entity.OrderList {
+func (db *orderRepositoryOld) CustomerOrder(customerOrder entity.OrderCustomer) entity.OrderList {
 	var orderlist entity.OrderList
 	current_date := time.Now().Local()
 	if customerOrder.CarId > 0 {
@@ -53,17 +42,12 @@ func (db *orderRepository) CustomerOrder(customerOrder entity.OrderCustomer) ent
 	return orderlist
 }
 
-func (db *orderRepository) CreateOrder(order entity.OrderCreate) entity.OrderCreate {
+func (db *orderRepositoryOld) CreateOrder(order entity.OrderCreate) entity.OrderCreate {
 	//order.RunNo = db.GetLastNo(order.CompanyId, order.BranchId, order.RouteId, order.RouteCode)
 	var data []entity.OrderLineStruct = order.DataList
 	var order_master entity.OrderMaster
-	var shift_number = 0
-	var order_no_new = db.GetLastNo(order.CompanyId, order.BranchId, order.RouteId, order.RouteCode)
+        var order_no_new = db.GetLastNo(order.CompanyId, order.BranchId, order.RouteId, order.RouteCode)
 	//var order_total_amt float64 = 0
-	convert_shift, err := strconv.ParseUint(order.LoginShift, 10, 32)
-	if err == nil {
-		shift_number = int(convert_shift)
-	}
 
 	//order_master.OrderNo = order.OrderNo
 	order_master.OrderNo = order_no_new
@@ -81,412 +65,137 @@ func (db *orderRepository) CreateOrder(order entity.OrderCreate) entity.OrderCre
 	order_master.Emp_1 = int64(order.EmpId)
 	order_master.Emp_2 = int64(order.EmpId2)
 	order_master.OrderDate2 = time.Now()
-	order_master.OrderShift = int64(shift_number)
+	order_master.OrderShift = 0
 	order_master.DiscountAmt = order.Discount
 	order_master.PaymentMethodId = int64(order.PaymentTypeId)
 	order_master.OrderTotalAmt = order.OrderTotalAmount
 
-	tx := db.connect.Begin()
-	if tx.Error != nil {
-		log.Printf("[CreateOrder] failed to begin transaction: %v", tx.Error)
-		return order
-	}
+	//tx := db.connect.Begin()
 
-	if err := tx.Table("orders").Create(&order_master).Error; err != nil {
-		tx.Rollback()
-		log.Printf("[CreateOrder] failed to create order master: %v", err)
-		return order
-	}
+	res := db.connect.Table("orders").Create(&order_master) // save and return id
+	if res.RowsAffected > 0 {
+		//print(res.RowsAffected)
+		//print(order_master.Id)
 
-	orderLines := make([]entity.OrderDetail, 0, len(data))
-	for i := range data {
-		if data[i].Qty <= 0 {
-			continue
-		}
+		for i := 0; i <= len(data)-1; i++ {
+			//print(data[0].ProductId)
+			if data[i].Qty <= 0 {
+				continue
+			}
+			line_total := (data[i].Qty * data[i].Price)
+			//order_total_amt += line_total
 
-		line_total := (data[i].Qty * data[i].Price)
-		var is_free int = 0
-		if order.PaymentTypeId == 3 {
-			is_free = 1
-		}
+			// var line_price float64 = 0
+			// var line_total_price float64 = 0
+			var is_free int = 0
 
-		var payment_method_new_id = int64(order.PaymentTypeId)
-		if order.Image != "" {
-			payment_method_new_id = 4
-		}
-
-		orderdetail := entity.OrderDetail{
-			OrderId:              order_master.Id,
-			CustomerId:           int64(order.CustomerId),
-			ProductId:            int64(data[i].ProductId),
-			Qty:                  data[i].Qty,
-			Price:                data[i].Price,
-			LineTotal:            line_total,
-			PriceGroupId:         int64(data[i].PriceGroupId),
-			Status:               1,
-			SalePaymentMethodId:  payment_method_new_id,
-			IssueRefId:           int64(order.IssueId),
-			IsFree:               int64(is_free),
-		}
-		orderLines = append(orderLines, orderdetail)
-	}
-
-	if len(orderLines) > 0 {
-		if err := tx.Table("order_line").Create(&orderLines).Error; err != nil {
-			tx.Rollback()
-			log.Printf("[CreateOrder] failed to batch create order lines: %v", err)
-			return order
-		}
-
-		// Perform operations that don't strictly require being inside the DB transaction (like stock/payment)
-		// but since UpdateStock has its own inner transaction, we should be careful.
-		// For now, we process them sequentially but after the bulk insert to minimize wait time on master record.
-		for _, line := range orderLines {
-			if order.PaymentTypeId != 3 {
-				db.AddPayment(uint64(order_master.Id), order.CustomerId, line.LineTotal, uint64(order.CompanyId), order.BranchId, uint64(line.SalePaymentMethodId), order.UserId, order.Image)
+			if order.PaymentTypeId == 3 {
+				is_free = 1
 			}
 
-			if err := db.UpdateStock(order.RouteId, uint64(line.ProductId), line.Qty); err != nil {
-				log.Printf("[CreateOrder] UpdateStock failed: %v", err)
+			var orderdetail entity.OrderDetail
+			orderdetail.OrderId = order_master.Id
+			orderdetail.CustomerId = int64(order.CustomerId)
+			orderdetail.ProductId = int64(data[i].ProductId)
+			orderdetail.Qty = data[i].Qty
+			orderdetail.Price = data[i].Price
+			orderdetail.LineTotal = line_total
+			orderdetail.PriceGroupId = int64(data[i].PriceGroupId)
+			orderdetail.Status = 1
+			orderdetail.SalePaymentMethodId = int64(order.PaymentTypeId)
+			orderdetail.IssueRefId = int64(order.IssueId)
+			orderdetail.IsFree = int64(is_free)
+
+			res2 := db.connect.Table("order_line").Create(&orderdetail)
+			if res2.RowsAffected > 0 {
+				if order.PaymentTypeId != 3 {
+					db.AddPayment(uint64(order_master.Id), order.CustomerId, orderdetail.LineTotal, uint64(order.CompanyId), order.BranchId, uint64(orderdetail.SalePaymentMethodId), order.UserId)
+				}
+				db.UpdateStock(order.RouteId, uint64(data[i].ProductId), data[i].Qty)
 			}
 		}
-	}
-
-	if err := tx.Commit().Error; err != nil {
-		log.Printf("[CreateOrder] failed to commit transaction: %v", err)
-		return order
-	}
 		// if order_total_amt > 0 {
 		// 	db.connect.Table("orders").Where("id = ?", order_master.Id).Update("order_total_amt", order_total_amt)
 		// }
-
-       if order.SaleTypeError != "" { // send notification when has sale type error
-		log.Println("[CreateOrder] sending notification for sale type error")
-		go func(order entity.OrderCreate) {
-			params := url.Values{}
-			params.Add("route_id", strconv.Itoa(int(order.RouteId)))
-			params.Add("company_id", strconv.Itoa(int(order.CompanyId)))
-			params.Add("branch_id", strconv.Itoa(int(order.BranchId)))
-			params.Add("user_id", strconv.Itoa(int(order.UserId)))
-			params.Add("message", order.SaleTypeError)
-			params.Add("order_no", order.OrderNo)
-			params.Add("customer_name", order.CustomerName)
-			params.Add("total_amount", fmt.Sprintf("%f", order.OrderTotalAmount))
-
-			notificationURL := remoteServerHost + "/icesystem/frontend/web/api/order/createnotifyerrorsaletype"
-			resp, err := http.PostForm(notificationURL, params) // NKY
-			if err != nil {
-				log.Printf("[CreateOrder] notification api error: %v", err)
-				return
-			}
-			defer resp.Body.Close()
-			log.Printf("[CreateOrder] notification sent, status: %s", resp.Status)
-		}(order)
-	} 
-
+	}
 	// tx.Commit()
 
 	return order
 }
 
-type SelectedData struct {
+type SelectedDataOld struct {
 	Id        uint64  `json:"id"`
 	ProductId uint64  `json:"product_id"`
 	AvlQty    float64 `json:"avl_qty"`
 }
 
-func (db *orderRepository) UpdateStock(route_id uint64, product_id uint64, qty float64) error {
-	var selectedData SelectedData
-
-	currentDate := time.Now().Local()
-	yesterday := currentDate.AddDate(0, 0, -1)
-
-	tx := db.connect.Begin() // 🔒 เริ่ม transaction
-
-	// 🕒 พยายามหาข้อมูลของวันนี้ก่อน
-	err := tx.Table("order_stock").
-		Where("route_id = ?", route_id).
-		Where("product_id = ?", product_id).
-		Where("DATE(trans_date) = ?", currentDate.Format("2006-01-02")).
-		Where("avl_qty >= ?", qty).
-		Select("id, product_id, avl_qty").
-		Scan(&selectedData).Error
-
-	if err != nil {
-		tx.Rollback()
-		return fmt.Errorf("error finding stock: %v", err)
-	}
-
-	// ถ้าไม่พบข้อมูลวันนี้ → ลองย้อนหลัง 1 วัน
-	if selectedData.Id == 0 {
-		err = tx.Table("order_stock").
-			Where("route_id = ?", route_id).
-			Where("product_id = ?", product_id).
-			Where("DATE(trans_date) = ?", yesterday.Format("2006-01-02")).
-			Where("avl_qty >= ?", qty).
-			Select("id, product_id, avl_qty").
-			Scan(&selectedData).Error
-
-		if err != nil {
-			tx.Rollback()
-			return fmt.Errorf("error finding yesterday stock: %v", err)
+func (db *orderRepositoryOld) UpdateStock(route_id uint64, product_id uint64, qty float64) {
+	var selectedData SelectedDataOld
+	//	res := db.connect.Table("order_stock").Where("route_id =?", route_id).Where("product_id = ?", product_id).Where("avl_qty >= ?", qty).Where("order_id = 202653").Select("id,product_id,avl_qty").Scan(&selectedData)
+	res := db.connect.Table("order_stock").Where("route_id =?", route_id).Where("product_id = ?", product_id).Where("avl_qty >= ?", qty).Select("id,product_id,avl_qty").Scan(&selectedData)
+	if res.Error == nil {
+		res_update := db.connect.Table("order_stock").Where("id=?", selectedData.Id).Update("avl_qty", (selectedData.AvlQty - qty))
+		if res_update.Error == nil {
+			print("update stock ok")
+			// print(selectedData.ProductId)
 		}
 	}
-
-	// ถ้าไม่เจอทั้งวันนี้และเมื่อวาน
-	if selectedData.Id == 0 {
-		tx.Rollback()
-		return fmt.Errorf("no stock available for product %d (today or yesterday)", product_id)
-	}
-
-	// 🔄 อัปเดตแบบ atomic
-	if err := tx.Table("order_stock").
-		Where("id = ? AND avl_qty >= ?", selectedData.Id, qty).
-		UpdateColumn("avl_qty", gorm.Expr("avl_qty - ?", qty)).Error; err != nil {
-		tx.Rollback()
-		return fmt.Errorf("update failed: %v", err)
-	}
-
-	return tx.Commit().Error
 }
 
-
-// func (db *orderRepository) UpdateStock(route_id uint64, product_id uint64, qty float64) error {
-// 	var selectedData SelectedData
-
-// 	current_date := time.Now().Local()
-
-// 	tx := db.connect.Begin() // 🔒 เริ่ม transaction
-
-// 	if err := tx.Table("order_stock").
-// 		Where("route_id = ?", route_id).
-// 		Where("product_id = ?", product_id).
-// 		Where("DATE(trans_date) = ?", current_date.Format("2006-01-02")).
-// 		Where("avl_qty >= ?", qty).
-// 		Select("id, product_id, avl_qty").
-// 		Scan(&selectedData).Error; err != nil {
-// 		tx.Rollback()
-// 		return fmt.Errorf("stock not found or insufficient: %v", err)
-// 	}
-
-// 	if selectedData.Id == 0 {
-// 		tx.Rollback()
-// 		return fmt.Errorf("no stock available for product %d", product_id)
-// 	}
-
-// 	// 🔄 อัปเดตแบบ atomic ปลอดภัยกว่า
-// 	if err := tx.Table("order_stock").
-// 		Where("id = ? AND avl_qty >= ?", selectedData.Id, qty).
-// 		UpdateColumn("avl_qty", gorm.Expr("avl_qty - ?", qty)).Error; err != nil {
-// 		tx.Rollback()
-// 		return fmt.Errorf("update failed: %v", err)
-// 	}
-
-// 	return tx.Commit().Error
-// }
-
-
-func (db *orderRepository) AddPayment(order_id uint64, customer_id uint64, amount float64, company_id uint64, branch_id uint64, payment_type_id uint64, user_id uint64, image string) {
-	//var findone uint64 = 0
+func (db *orderRepositoryOld) AddPayment(order_id uint64, customer_id uint64, amount float64, company_id uint64, branch_id uint64, payment_type_id uint64, user_id uint64) {
+	var findone uint64 = 0
 	var pay_amount float64 = 0
-	//current_date := time.Now().Local()
+	current_date := time.Now().Local()
 
-	var new_file = ""
-	var is_cash_transfer_payment = 1; // 1 cash, 2 transfer
-
-	if image != "" {
-		print("has photo");
-		var z = 0
-		//var ostypename = "http://192.168.60.191/icesystem/backend/web/uploads/"
-
-		// The path to the image you want to upload
-		imagePath := "/var/www/html/icesystem/backend/web/uploads/files/receive/"
-
-		//fmt.Println(i, s)
-		z += 1
-		y := fmt.Sprintf("%v", z)
-
-		var b64 = image
-		dc, err := base64.StdEncoding.DecodeString(b64)
-		if err != nil {
-			panic(err)
+	recid := db.connect.Table("payment_receive").Where("customer_id = ?", customer_id).Where("date(trans_date) = ?", current_date.Format("2006-01-02")).Select("id").Take(&findone)
+	if recid != nil {
+		if payment_type_id == 1 {
+			pay_amount = amount
 		}
-		new_file = strconv.FormatInt(time.Now().Unix(), 20) + y + ".jpg"
-
-		//f, err := os.Create("http://172.16.0.29/cicsupport/backend/web/uploads/myfilename.jpg")
-		f, err := os.OpenFile(imagePath+new_file, os.O_WRONLY|os.O_CREATE, 0777) //administrator@172.16.0.240/uploads
-		if err != nil {
-			panic(err);
-			print("create file error");
-		}
-		//ostype := runtime.GOOS
-
-		//log.Print(ostype)
-
-		// f, err := os.OpenFile(ostypename+new_file, os.O_WRONLY|os.O_CREATE, 0777) //administrator@172.16.0.240/uploads
-		// if err != nil {
-		// 	panic(err)
-		// }
-
-		if _, err := f.Write(dc); err != nil {
-			panic(err)
-		}
-
-		defer f.Close()
-
-		go sendFileToPHPServer(new_file)
-
-	}
-
-	var payment = entity.PaymentMaster{
-		Id:         0,
-		TransDate:  time.Now(),
-		CustomerId: customer_id,
-		JournalNo:  db.GetPayLastNo(company_id, branch_id),
-		Status:     1,
-		CompanyId:  company_id,
-		BranchId:   branch_id,
-		CratedBy:   user_id,
-		CreatedAt:  uint64(time.Now().Unix()),
-		SlipDoc:    new_file,
-	}
-	if(new_file !=""){
-		is_cash_transfer_payment = 4
-	}
-	if payment.JournalNo != "error na ja" {
-		res := db.connect.Table("payment_receive").Create(&payment)
-		if res.Error == nil {
-			res_save_detail := db.connect.Table("payment_receive_line").Create(map[string]interface{}{"payment_receive_id": payment.Id, "order_id": order_id, "payment_amount": pay_amount, "payment_channel_id": is_cash_transfer_payment, "payment_method_id": payment_type_id, "status": 1, "payment_type_id": payment_type_id})
+		println("not error but not found record")
+		if findone > 0 {
+			print("has old payment data")
+			res_save_detail := db.connect.Table("payment_receive_line").Create(map[string]interface{}{"payment_receive_id": findone, "order_id": order_id, "payment_amount": pay_amount, "payment_channel_id": 1, "payment_method_id": payment_type_id, "status": 1, "payment_type_id": payment_type_id})
 			if res_save_detail.Error == nil {
-				print("create payment")
+				print("create payment has old")
 			}
+		} else {
+			//res := db.connect.Table("payment_receive").Create(map[string]interface{}{"trans_date": time.Now(), "journal_no": "xx", "status": 1, "company_id": company_id, "branch_id": branch_id})
+			var payment = entity.PaymentMaster{
+				Id:         0,
+				TransDate:  time.Now(),
+				CustomerId: customer_id,
+				JournalNo:  db.GetPayLastNo(company_id, branch_id),
+				Status:     1,
+				CompanyId:  company_id,
+				BranchId:   branch_id,
+				CratedBy:   user_id,
+				CreatedAt:  uint64(time.Now().Unix()),
+			}
+			if payment.JournalNo != "error na ja" {
+				res := db.connect.Table("payment_receive").Create(&payment)
+				if res.Error == nil {
+					res_save_detail := db.connect.Table("payment_receive_line").Create(map[string]interface{}{"payment_receive_id": payment.Id, "order_id": order_id, "payment_amount": pay_amount, "payment_channel_id": 1, "payment_method_id": payment_type_id, "status": 1, "payment_type_id": payment_type_id})
+					if res_save_detail.Error == nil {
+						print("create payment")
+					}
+				}
+			}
+
 		}
+
+	} else {
+		print("not have old payment data")
 	}
-
-
-
-	// recid := db.connect.Table("payment_receive").Where("customer_id = ?", customer_id).Where("date(trans_date) = ?", current_date.Format("2006-01-02")).Select("id").Take(&findone)
-	// if recid != nil {
-	// 	if payment_type_id == 1 {
-	// 		pay_amount = amount
-	// 	}
-	// 	println("not error but not found record")
-	// 	if findone > 0 {
-	// 		print("has old payment data")
-	// 		res_save_detail := db.connect.Table("payment_receive_line").Create(map[string]interface{}{"payment_receive_id": findone, "order_id": order_id, "payment_amount": pay_amount, "payment_channel_id": 1, "payment_method_id": payment_type_id, "status": 1, "payment_type_id": payment_type_id})
-	// 		if res_save_detail.Error == nil {
-	// 			print("create payment has old")
-	// 		}
-
-
-	// 	} else {
-	// 		//res := db.connect.Table("payment_receive").Create(map[string]interface{}{"trans_date": time.Now(), "journal_no": "xx", "status": 1, "company_id": company_id, "branch_id": branch_id})
-	// 		var payment = entity.PaymentMaster{
-	// 			Id:         0,
-	// 			TransDate:  time.Now(),
-	// 			CustomerId: customer_id,
-	// 			JournalNo:  db.GetPayLastNo(company_id, branch_id),
-	// 			Status:     1,
-	// 			CompanyId:  company_id,
-	// 			BranchId:   branch_id,
-	// 			CratedBy:   user_id,
-	// 			CreatedAt:  uint64(time.Now().Unix()),
-	// 			SlipDoc:    new_file,
-	// 		}
-	// 		if(new_file !=""){
-	// 			is_cash_transfer_payment = 4
-	// 		}
-	// 		if payment.JournalNo != "error na ja" {
-	// 			res := db.connect.Table("payment_receive").Create(&payment)
-	// 			if res.Error == nil {
-	// 				res_save_detail := db.connect.Table("payment_receive_line").Create(map[string]interface{}{"payment_receive_id": payment.Id, "order_id": order_id, "payment_amount": pay_amount, "payment_channel_id": is_cash_transfer_payment, "payment_method_id": payment_type_id, "status": 1, "payment_type_id": payment_type_id})
-	// 				if res_save_detail.Error == nil {
-	// 					print("create payment")
-	// 				}
-	// 			}
-	// 		}
-
-	// 	}
-
-	// } else {
-	// 	print("not have old payment data")
-	// }
 }
 
-func sendFileToPHPServer(filename string) {
-	// 📁 Path ไฟล์จริงที่เพิ่งบันทึกไว้
-	filePath := filepath.Join("/var/www/html/icesystem/backend/web/uploads/files/receive/", filename)
-
-	file, err := os.Open(filePath)
-	if err != nil {
-		fmt.Println("❌ Error opening file:", err)
-		return
-	}
-	defer file.Close()
-
-	// 🧩 สร้าง multipart form
-	body := &bytes.Buffer{}
-	writer := multipart.NewWriter(body)
-
-	// form field name ต้องตรงกับ PHP ($_FILES['image'])
-	part, err := writer.CreateFormFile("image", filepath.Base(filename))
-	if err != nil {
-		fmt.Println("❌ Error creating form file:", err)
-		return
-	}
-
-	// คัดลอกข้อมูลไฟล์ใส่ body
-	if _, err = io.Copy(part, file); err != nil {
-		fmt.Println("❌ Error copying file:", err)
-		return
-	}
-
-	// ✅ เพิ่ม field อื่น ๆ (option) เช่น ชื่อไฟล์, token, หรือ ID
-	_ = writer.WriteField("filename", filename)
-	// _ = writer.WriteField("auth_key", "YOUR_TOKEN_IF_NEEDED")
-
-	writer.Close()
-
-	// 🌐 ส่งไฟล์ไปยัง PHP endpoint
-	uploadURL := remoteServerHost + "/icesystem/backend/web/index.php?r=site/uploadfromgo"
-	req, err := http.NewRequest("POST", uploadURL, body)
-	if err != nil {
-		fmt.Println("❌ Error creating request:", err)
-		return
-	}
-	req.Header.Set("Content-Type", writer.FormDataContentType())
-
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Println("❌ Error sending request:", err)
-		return
-	}
-	defer resp.Body.Close()
-
-	// ✅ ตรวจสอบ response
-	respBody, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("⚠️ PHP server responded: %s\n%s\n", resp.Status, string(respBody))
-		return
-	}
-
-	fmt.Println("✅ File sent to PHP server successfully")
-}
-
-
-type MaxOrderNo struct {
+type MaxOrderNoOld struct {
 	Id      uint64 `json:"id"`
 	OrderNo string `json:"order_no"`
 }
 
-type MaxOrderNoNew struct {
-	Id     uint64 `json:"id"`
-	LastNo string `json:"last_no"`
-}
-
-func (db *orderRepository) GetLastNo(company_id uint64, branch_id uint64, route_id uint64, route_code string) string {
-	var max_order_no MaxOrderNo
+func (db *orderRepositoryOld) GetLastNo(company_id uint64, branch_id uint64, route_id uint64, route_code string) string {
+	var max_order_no MaxOrderNoOld
 	var pre string = "CO-" + route_code
 	var prefix string = ""
 	var cnum string = ""
@@ -556,99 +265,13 @@ func (db *orderRepository) GetLastNo(company_id uint64, branch_id uint64, route_
 	return prefix
 }
 
-func (db *orderRepository) GetLastNoNew(company_id uint64, branch_id uint64, route_id uint64, route_code string) string {
-	var max_order_no MaxOrderNoNew
-	var pre string = "CO-" + route_code
-	var prefix string = ""
-	var cnum string = ""
-	// var cnum2 int64 = 8
-	var cnum3 int64 = 0
-	//current_date := time.Now().Local()
-
-	// row := db.connect.Table("orders").Where("company_id=?", company_id).Where("branch_id=?", branch_id).Where("order_channel_id=?", route_id).Where("sale_from_mobile=1").Where("order_no LIKE ?", "CO%").Select("max(order_no)").Row()
-	// err := row.Scan(&max_order_no)
-	// if err != nil {
-	// 	return "error na ja"
-	// }
-	row := db.connect.Table("sequence_order_trans").Where("route_id=?", route_id).Where("order_type_id=1").Last(&max_order_no)
-	if row.Error != nil {
-		//return "error na ja"
-	}
-	// if row.Error != nil {
-	// 	print("error na")
-	// }
-
-	if max_order_no.LastNo != "" {
-		//max_order_no = "CO-VP31-230314-0009"
-		var full_year string = strconv.Itoa(time.Now().Year())
-		var full_month string = strconv.Itoa(int(time.Now().Month()))
-		if len(full_month) == 1 {
-			full_month = "0" + full_month
-		}
-		var full_day string = strconv.Itoa(time.Now().Day())
-		if len(full_day) == 1 {
-			full_day = "0" + full_day
-		}
-		prefix = pre + "-" + full_year[2:len(full_year)] + full_month + full_day + "-"
-		cnum = max_order_no.LastNo[15:len(max_order_no.LastNo)]
-		// cnum = "000"
-		if cnumx, err := strconv.ParseInt(cnum, 10, 64); err != nil {
-			panic(err)
-		} else {
-			//print("okk")
-			cnum3 = cnumx + 1
-			// cnum2 = cnumx
-		}
-		//cnum3 = cnum2 + 1
-
-		var strlen int = len(cnum)
-		var clen int = len(strconv.Itoa(int(cnum3)))
-		var loop int = strlen - clen
-
-		for i := 0; i <= loop-1; i++ {
-			prefix = prefix + "0"
-		}
-		prefix = prefix + strconv.Itoa(int(cnum3))
-
-		//return strconv.Itoa(int(cnum2))
-
-		// update new order no
-
-		res_update_lastno := db.connect.Table("sequence_order_trans").Where("id=?", max_order_no.Id).Update("last_no", (prefix))
-		if res_update_lastno.Error == nil {
-			print("update last no ok")
-			// print(selectedData.ProductId)
-		}
-
-	} else {
-		var full_year string = strconv.Itoa(time.Now().Year())
-		var full_month string = strconv.Itoa(int(time.Now().Month()))
-		if len(full_month) == 1 {
-			full_month = "0" + full_month
-		}
-		var full_day string = strconv.Itoa(time.Now().Day())
-		if len(full_day) == 1 {
-			full_day = "0" + full_day
-		}
-		prefix = pre + "-" + full_year[2:len(full_year)] + full_month + full_day + "-" + "0001"
-
-		/// create new last no
-		res_save_new_last_no := db.connect.Table("sequence_order_trans").Create(map[string]interface{}{"order_type_id": 1, "route_id": route_id, "last_no": prefix})
-		if res_save_new_last_no.Error == nil {
-			print("create new last no")
-		}
-	}
-
-	return prefix
-}
-
-type MaxPayJournalNo struct {
+type MaxPayJournalNoOld struct {
 	Id        uint64 `json:"id"`
 	JournalNo string `json:"journal_no"`
 }
 
-func (db *orderRepository) GetPayLastNo(company_id uint64, branch_id uint64) string {
-	var max_journal_no MaxPayJournalNo
+func (db *orderRepositoryOld) GetPayLastNo(company_id uint64, branch_id uint64) string {
+	var max_journal_no MaxPayJournalNoOld
 	var pre string = "AR-"
 	var prefix string = ""
 	var cnum string = ""
@@ -723,12 +346,12 @@ func (db *orderRepository) GetPayLastNo(company_id uint64, branch_id uint64) str
 }
 
 // CloseOrder implements OrderRepository
-type OrderStockQty struct {
+type OrderStockQtyOld struct {
 	ProductId uint64  `json:"product_id"`
 	AvlQty    float64 `json:"avl_qty"`
 }
 
-type StockTrans struct {
+type StockTransOld struct {
 	JournalNo      string    `json:"journal_no"`
 	TransDate      time.Time `json:"trans_date"`
 	ProductId      uint64    `json:"product_id"`
@@ -743,9 +366,9 @@ type StockTrans struct {
 	CreatedAt      uint64    `json:"created_at"`
 }
 
-func (db *orderRepository) CloseOrder(order entity.OrderClose) int {
+func (db *orderRepositoryOld) CloseOrder(order entity.OrderClose) int {
 	var resData int = 0
-	var orderStockQty []OrderStockQty
+	var orderStockQty []OrderStockQtyOld
 	var res_update_sum bool = false
 	var res_update_boot_sum bool = false
 
@@ -763,7 +386,7 @@ func (db *orderRepository) CloseOrder(order entity.OrderClose) int {
 			// if orderStockQty[i].AvlQty <= 0 {
 			// 	continue
 			// }
-			var stockTrans StockTrans
+			var stockTrans StockTransOld
 			stockTrans.JournalNo = db.GetReturnLastNo(order.CompanyId, order.BranchId)
 			stockTrans.TransDate = time.Now().Local()
 			stockTrans.ProductId = orderStockQty[i].ProductId
@@ -877,12 +500,12 @@ func (db *orderRepository) CloseOrder(order entity.OrderClose) int {
 		}
 
 		defer resp.Body.Close()
-	} 
+	}
 
 	return resData
 }
 
-func (db *orderRepository) getDefaultWh(company_id int64, branch_id int64) int {
+func (db *orderRepositoryOld) getDefaultWh(company_id int64, branch_id int64) int {
 	default_wh := 12
 	res := db.connect.Table("warehouse").Where("is_reprocess = 1 and company_id = ? and branch_id = ?", company_id, branch_id).Select("id").Scan(&default_wh)
 	if res.Error != nil {
@@ -891,19 +514,19 @@ func (db *orderRepository) getDefaultWh(company_id int64, branch_id int64) int {
 	return default_wh
 }
 
-type StockSumData struct {
+type StockSumDataOld struct {
 	Id  uint64  `json:"id"`
 	Qty float64 `json:"qty"`
 }
 
-type StockSumDataNew struct {
+type StockSumDataNewOld struct {
 	WarehouseId uint64  `json:"warehouse_id"`
 	ProductId   uint64  `json:"product_id"`
 	Qty         float64 `json:"qty"`
 	CompanyId   uint64  `json:"company_id"`
 	BranchId    uint64  `json:"branch_id"`
 }
-type SaleRouteDailyClose struct {
+type SaleRouteDailyCloseOld struct {
 	TransDate  uint64  `json:"trans_date"`
 	ProductId  uint64  `json:"product_id"`
 	Qty        float64 `json:"qty"`
@@ -913,7 +536,7 @@ type SaleRouteDailyClose struct {
 	OrderShift uint64  `json:"order_shift"`
 	CreatedBy  uint64  `json:"created_by"`
 }
-type SaleRouteDailyClose2 struct {
+type SaleRouteDailyClose2Old struct {
 	TransDate  uint64  `json:"trans_date"`
 	ProductId  uint64  `json:"product_id"`
 	Qty        float64 `json:"qty"`
@@ -923,9 +546,9 @@ type SaleRouteDailyClose2 struct {
 	OrderShift uint64  `json:"order_shift"`
 }
 
-func (db *orderRepository) updateSummary(product_id uint64, warehouse_id uint64, return_qty float64, company_id uint64, branch_id uint64) bool {
-	var old_qty StockSumData
-	var new_stock StockSumDataNew
+func (db *orderRepositoryOld) updateSummary(product_id uint64, warehouse_id uint64, return_qty float64, company_id uint64, branch_id uint64) bool {
+	var old_qty StockSumDataOld
+	var new_stock StockSumDataNewOld
 	var is_update bool = false
 
 	res := db.connect.Table("stock_sum").Select("id,qty").Where("warehouse_id=? and product_id =? and company_id=? and branch_id=?", warehouse_id, product_id, company_id, branch_id).Scan(&old_qty)
@@ -959,10 +582,10 @@ func (db *orderRepository) updateSummary(product_id uint64, warehouse_id uint64,
 	return is_update
 }
 
-func (db *orderRepository) updateBootSummary(product_id uint64, user_id uint64, route_id uint64, qty float64, company_id uint64, branch_id uint64) bool {
+func (db *orderRepositoryOld) updateBootSummary(product_id uint64, user_id uint64, route_id uint64, qty float64, company_id uint64, branch_id uint64) bool {
 	var resData bool = false
-	var saleDailyClose SaleRouteDailyClose2
-	var findData StockSumData
+	var saleDailyClose SaleRouteDailyClose2Old
+	var findData StockSumDataOld
 	var orderShift uint64 = 0
 	current_date := time.Now().Local()
 
@@ -992,7 +615,7 @@ func (db *orderRepository) updateBootSummary(product_id uint64, user_id uint64, 
 	return resData
 }
 
-type SeqModel struct {
+type SeqModelOld struct {
 	Id        int64  `json:"id"`
 	Prefix    string `json:"prefix"`
 	Symbol    string `json:"symbol"`
@@ -1002,12 +625,12 @@ type SeqModel struct {
 	MaximumNo int64  `json:"maximumn"`
 }
 
-func (db *orderRepository) GetReturnLastNo(company_id uint64, branch_id uint64) string {
-	var max_journal_no MaxPayJournalNo
+func (db *orderRepositoryOld) GetReturnLastNo(company_id uint64, branch_id uint64) string {
+	var max_journal_no MaxPayJournalNoOld
 	var pre string = ""
 	var prefix string = ""
 	var cnum string = ""
-	var seq_data SeqModel
+	var seq_data SeqModelOld
 	// var cnum2 int64 = 8
 	var cnum3 int64 = 0
 	// var prefix2 strings.Builder
@@ -1097,54 +720,6 @@ func (db *orderRepository) GetReturnLastNo(company_id uint64, branch_id uint64) 
 	return prefix
 }
 
-func (db *UserConnect) UpdatePhoto(photo entity.SlipDoc, payment_id uint64) bool {
-	//	 var photo []
-	//var id int
-
-	var z = 0
-	var ostypename = ""
-	var new_file = ""
-	for _, s := range photo.Image {
-		//fmt.Println(i, s)
-		z += 1
-		y := fmt.Sprintf("%v", z)
-
-		var b64 = s
-		dc, err := base64.StdEncoding.DecodeString(b64)
-		if err != nil {
-			panic(err)
-		}
-		new_file = strconv.FormatInt(time.Now().Unix(), 20) + y + ".jpg"
-
-		//f, err := os.Create("http://172.16.0.29/cicsupport/backend/web/uploads/myfilename.jpg")
-
-		ostype := runtime.GOOS
-
-		log.Print(ostype)
-
-		f, err := os.OpenFile(ostypename+new_file, os.O_WRONLY|os.O_CREATE, 0777) //administrator@172.16.0.240/uploads
-		if err != nil {
-			panic(err)
-		}
-
-		defer f.Close()
-
-		if _, err := f.Write(dc); err != nil {
-			panic(err)
-		}
-
-		result := db.connect.Table("payment_receive").Where("id = ?", payment_id).Updates(map[string]interface{}{"slip_doc": new_file})
-		// result := db.connect.Table("person").Updates(map[string]interface{}{"photo": new_file})
-		if result.RowsAffected > 0 {
-			return true
-		} else {
-			return false
-		}
-
-	}
-	return true
-}
-
-func NewOrderRepository(db *gorm.DB) OrderRepository {
-	return &orderRepository{connect: db}
+func NewOrderRepositoryOld(db *gorm.DB) OrderRepositoryOld {
+	return &orderRepositoryOld{connect: db}
 }
