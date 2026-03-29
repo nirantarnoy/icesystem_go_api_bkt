@@ -19,7 +19,7 @@ import (
 	"tarlek.com/icesystem/entity"
 )
 
-const remoteServerHost = "http://141.98.19.240"
+const remoteServerHost = "http://103.13.28.31"
 
 type OrderRepository interface {
 	CreateOrder(order entity.OrderCreate) entity.OrderCreate
