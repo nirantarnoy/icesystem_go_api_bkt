@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"gorm.io/gorm"
@@ -313,9 +314,9 @@ func (db *orderRepository) AddPayment(order_id uint64, customer_id uint64, amoun
 	if payment.JournalNo != "error na ja" {
 		res := db.connect.Table("payment_receive").Create(&payment)
 		if res.Error == nil {
-			log.Printf("✅ [AddPayment] create payment master record success (id: %d)", payment.Id)
+			log.Printf("✅ [AddPayment] create payment master record success (id: %d, imageLen: %d)", payment.Id, len(image))
 			if image != "" {
-				log.Println("📸 [AddPayment] found image in order, starting UpdatePhoto...")
+				log.Println("📸 [AddPayment] image is NOT empty, entering if-block")
 				userRepo := &UserConnect{connect: db.connect}
 				slipDoc := entity.SlipDoc{
 					Image: []string{image},
@@ -1094,9 +1095,18 @@ func (db *UserConnect) UpdatePhoto(photo entity.SlipDoc, payment_id uint64) (str
 		z += 1
 		y := fmt.Sprintf("%v", z)
 
-		dc, err := base64.StdEncoding.DecodeString(s)
+		base64Data := s
+		if len(s) > 30 {
+			// Strip prefix if exists (e.g., data:image/jpeg;base64,)
+			if commaIdx := strings.Index(s, ","); commaIdx != -1 {
+				base64Data = s[commaIdx+1:]
+				log.Println("✂️ [UpdatePhoto] stripped base64 prefix")
+			}
+		}
+
+		dc, err := base64.StdEncoding.DecodeString(base64Data)
 		if err != nil {
-			log.Printf("❌ [UpdatePhoto] decode error: %v", err)
+			log.Printf("❌ [UpdatePhoto] decode error: %v, string snippet: %s...", err, s[:10])
 			return "", err
 		}
 
