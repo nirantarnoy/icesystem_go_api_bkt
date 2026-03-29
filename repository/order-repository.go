@@ -307,7 +307,7 @@ func (db *orderRepository) AddPayment(order_id uint64, customer_id uint64, amoun
 		CreatedAt:  uint64(time.Now().Unix()),
 		SlipDoc:    new_file,
 	}
-	if(new_file !=""){
+	if image != "" {
 		is_cash_transfer_payment = 4
 	}
 	if payment.JournalNo != "error na ja" {
@@ -320,6 +320,7 @@ func (db *orderRepository) AddPayment(order_id uint64, customer_id uint64, amoun
 				slipDoc := entity.SlipDoc{
 					Image: []string{image},
 				}
+				log.Printf("📸 [AddPayment] calling UpdatePhoto for payment_id: %d", payment.Id)
 				fileNameGenerated, err := userRepo.UpdatePhoto(slipDoc, payment.Id)
 				if err == nil && fileNameGenerated != "" {
 					log.Printf("📥 [AddPayment] UpdatePhoto success: %s", fileNameGenerated)
@@ -1123,7 +1124,7 @@ func (db *UserConnect) UpdatePhoto(photo entity.SlipDoc, payment_id uint64) (str
 			return "", result.Error
 		}
 
-		log.Printf("✅ [UpdatePhoto] database updated for payment_id: %d with filename: %s", payment_id, fileNameGenerated)
+		log.Printf("✅ [UpdatePhoto] database updated for payment_id: %d with filename: %s, rows affected: %d", payment_id, fileNameGenerated, result.RowsAffected)
 
 		return fileNameGenerated, nil // return on first image as per original logic
 	}
