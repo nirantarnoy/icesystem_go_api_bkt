@@ -85,6 +85,7 @@ func (db *orderRepository) CreateOrder(order entity.OrderCreate) entity.OrderCre
 	order_master.DiscountAmt = order.Discount
 	order_master.PaymentMethodId = int64(order.PaymentTypeId)
 	order_master.OrderTotalAmt = order.OrderTotalAmount
+	order_master.Latlong = order.Latlong
 
 	tx := db.connect.Begin()
 	if tx.Error != nil {

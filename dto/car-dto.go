@@ -36,4 +36,5 @@ type OrderCreateDto struct {
 	Image            string            `json:"image"`
 	SaleTypeError    string            `json:"sale_type_error"`
 	CustomerName     string            `json:"customer_name"`
+	Latlong          string            `json:"latlong"`
 }
