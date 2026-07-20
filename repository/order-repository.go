@@ -139,16 +139,24 @@ func (db *orderRepository) CreateOrder(order entity.OrderCreate) entity.OrderCre
 			return order
 		}
 
-		// Perform operations that don't strictly require being inside the DB transaction (like stock/payment)
-		// but since UpdateStock has its own inner transaction, we should be careful.
-		// For now, we process them sequentially but after the bulk insert to minimize wait time on master record.
+		// 🚀 Performance Optimized: ย้าย AddPayment ออกมารวมยอดบิลเดียว และใช้ Transaction (tx) เดียวกับ CreateOrder
+		var totalPaymentAmount float64 = 0
+
 		for _, line := range orderLines {
 			if order.PaymentTypeId != 3 {
-				db.AddPayment(uint64(order_master.Id), order.CustomerId, line.LineTotal, uint64(order.CompanyId), order.BranchId, uint64(line.SalePaymentMethodId), order.UserId, order.Image)
+				totalPaymentAmount += line.LineTotal
 			}
 
-			if err := db.UpdateStock(order.RouteId, uint64(line.ProductId), line.Qty); err != nil {
+			if err := db.UpdateStock(tx, order.RouteId, uint64(line.ProductId), line.Qty); err != nil {
 				log.Printf("[CreateOrder] UpdateStock failed: %v", err)
+			}
+		}
+
+		// ทำการบันทึก Payment ครั้งเดียวต่อบิล
+		if order.PaymentTypeId != 3 {
+			err := db.AddPayment(tx, uint64(order_master.Id), order.CustomerId, totalPaymentAmount, uint64(order.CompanyId), order.BranchId, uint64(order.PaymentTypeId), order.UserId, order.Image)
+			if err != nil {
+				log.Printf("[CreateOrder] AddPayment failed: %v", err)
 			}
 		}
 	}
@@ -196,13 +204,11 @@ type SelectedData struct {
 	AvlQty    float64 `json:"avl_qty"`
 }
 
-func (db *orderRepository) UpdateStock(route_id uint64, product_id uint64, qty float64) error {
+func (db *orderRepository) UpdateStock(tx *gorm.DB, route_id uint64, product_id uint64, qty float64) error {
 	var selectedData SelectedData
 
 	currentDate := time.Now().Local()
 	yesterday := currentDate.AddDate(0, 0, -1)
-
-	tx := db.connect.Begin() // 🔒 เริ่ม transaction
 
 	// 🕒 พยายามหาข้อมูลของวันนี้ก่อน
 	err := tx.Table("order_stock").
@@ -214,7 +220,6 @@ func (db *orderRepository) UpdateStock(route_id uint64, product_id uint64, qty f
 		Scan(&selectedData).Error
 
 	if err != nil {
-		tx.Rollback()
 		return fmt.Errorf("error finding stock: %v", err)
 	}
 
@@ -229,14 +234,12 @@ func (db *orderRepository) UpdateStock(route_id uint64, product_id uint64, qty f
 			Scan(&selectedData).Error
 
 		if err != nil {
-			tx.Rollback()
 			return fmt.Errorf("error finding yesterday stock: %v", err)
 		}
 	}
 
 	// ถ้าไม่เจอทั้งวันนี้และเมื่อวาน
 	if selectedData.Id == 0 {
-		tx.Rollback()
 		return fmt.Errorf("no stock available for product %d (today or yesterday)", product_id)
 	}
 
@@ -244,11 +247,10 @@ func (db *orderRepository) UpdateStock(route_id uint64, product_id uint64, qty f
 	if err := tx.Table("order_stock").
 		Where("id = ? AND avl_qty >= ?", selectedData.Id, qty).
 		UpdateColumn("avl_qty", gorm.Expr("avl_qty - ?", qty)).Error; err != nil {
-		tx.Rollback()
 		return fmt.Errorf("update failed: %v", err)
 	}
 
-	return tx.Commit().Error
+	return nil
 }
 
 
@@ -287,21 +289,22 @@ func (db *orderRepository) UpdateStock(route_id uint64, product_id uint64, qty f
 // }
 
 
-func (db *orderRepository) AddPayment(order_id uint64, customer_id uint64, amount float64, company_id uint64, branch_id uint64, payment_type_id uint64, user_id uint64, image string) {
-	//var findone uint64 = 0
-	var pay_amount float64 = 0
-	//current_date := time.Now().Local()
-
+func (db *orderRepository) AddPayment(tx *gorm.DB, order_id uint64, customer_id uint64, amount float64, company_id uint64, branch_id uint64, payment_type_id uint64, user_id uint64, image string) error {
+	var pay_amount float64 = amount // ใช้ amount รวมที่ส่งเข้ามา
 	var new_file = ""
-	var is_cash_transfer_payment = 1; // 1 cash, 2 transfer
+	var is_cash_transfer_payment = 1 // 1 cash, 2 transfer
 
-	// Removed redundant file saving logic as it's now handled by UpdatePhoto
+	if image != "" {
+		is_cash_transfer_payment = 4
+	}
+
+	journalNo := db.GetPayLastNo(tx, company_id, branch_id)
 
 	var payment = entity.PaymentMaster{
 		Id:         0,
 		TransDate:  time.Now(),
 		CustomerId: customer_id,
-		JournalNo:  db.GetPayLastNo(company_id, branch_id),
+		JournalNo:  journalNo,
 		Status:     1,
 		CompanyId:  company_id,
 		BranchId:   branch_id,
@@ -309,88 +312,46 @@ func (db *orderRepository) AddPayment(order_id uint64, customer_id uint64, amoun
 		CreatedAt:  uint64(time.Now().Unix()),
 		SlipDoc:    new_file,
 	}
-	if image != "" {
-		is_cash_transfer_payment = 4
-	}
+	
 	if payment.JournalNo != "error na ja" {
-		res := db.connect.Table("payment_receive").Create(&payment)
-		if res.Error == nil {
-			log.Printf("✅ [AddPayment] create payment master record success (id: %d, imageLen: %d)", payment.Id, len(image))
-			if image != "" {
-				log.Println("📸 [AddPayment] image is NOT empty, entering if-block")
-				userRepo := &UserConnect{connect: db.connect}
-				slipDoc := entity.SlipDoc{
-					Image: []string{image},
-				}
-				log.Printf("📸 [AddPayment] calling UpdatePhoto for payment_id: %d", payment.Id)
-				fileNameGenerated, err := userRepo.UpdatePhoto(slipDoc, payment.Id)
-				if err == nil && fileNameGenerated != "" {
-					log.Printf("📥 [AddPayment] UpdatePhoto success: %s", fileNameGenerated)
-					go sendFileToPHPServer(fileNameGenerated)
-				} else {
-					log.Printf("❌ [AddPayment] UpdatePhoto failed: %v", err)
-				}
-			}
-
-			res_save_detail := db.connect.Table("payment_receive_line").Create(map[string]interface{}{"payment_receive_id": payment.Id, "order_id": order_id, "payment_amount": pay_amount, "payment_channel_id": is_cash_transfer_payment, "payment_method_id": payment_type_id, "status": 1, "payment_type_id": payment_type_id})
-			if res_save_detail.Error == nil {
-				log.Printf("✅ [AddPayment] create payment detail record success")
-			} else {
-				log.Printf("❌ [AddPayment] create payment detail record failed: %v", res_save_detail.Error)
-			}
-		} else {
-			log.Printf("❌ [AddPayment] create payment master record failed: %v", res.Error)
+		if err := tx.Table("payment_receive").Create(&payment).Error; err != nil {
+			log.Printf("❌ [AddPayment] create payment master record failed: %v", err)
+			return err
 		}
+		
+		log.Printf("✅ [AddPayment] create payment master record success (id: %d, imageLen: %d)", payment.Id, len(image))
+		if image != "" {
+			log.Println("📸 [AddPayment] image is NOT empty, entering if-block")
+			userRepo := &UserConnect{connect: tx} // ใช้ tx แทน db.connect
+			slipDoc := entity.SlipDoc{
+				Image: []string{image},
+			}
+			log.Printf("📸 [AddPayment] calling UpdatePhoto for payment_id: %d", payment.Id)
+			fileNameGenerated, err := userRepo.UpdatePhoto(slipDoc, payment.Id)
+			if err == nil && fileNameGenerated != "" {
+				log.Printf("📥 [AddPayment] UpdatePhoto success: %s", fileNameGenerated)
+				go sendFileToPHPServer(fileNameGenerated)
+			} else {
+				log.Printf("❌ [AddPayment] UpdatePhoto failed: %v", err)
+			}
+		}
+
+		if err := tx.Table("payment_receive_line").Create(map[string]interface{}{
+			"payment_receive_id": payment.Id, 
+			"order_id": order_id, 
+			"payment_amount": pay_amount, 
+			"payment_channel_id": is_cash_transfer_payment, 
+			"payment_method_id": payment_type_id, 
+			"status": 1, 
+			"payment_type_id": payment_type_id,
+		}).Error; err != nil {
+			log.Printf("❌ [AddPayment] create payment detail record failed: %v", err)
+			return err
+		}
+		log.Printf("✅ [AddPayment] create payment detail record success")
 	}
-
-
-
-	// recid := db.connect.Table("payment_receive").Where("customer_id = ?", customer_id).Where("date(trans_date) = ?", current_date.Format("2006-01-02")).Select("id").Take(&findone)
-	// if recid != nil {
-	// 	if payment_type_id == 1 {
-	// 		pay_amount = amount
-	// 	}
-	// 	println("not error but not found record")
-	// 	if findone > 0 {
-	// 		print("has old payment data")
-	// 		res_save_detail := db.connect.Table("payment_receive_line").Create(map[string]interface{}{"payment_receive_id": findone, "order_id": order_id, "payment_amount": pay_amount, "payment_channel_id": 1, "payment_method_id": payment_type_id, "status": 1, "payment_type_id": payment_type_id})
-	// 		if res_save_detail.Error == nil {
-	// 			print("create payment has old")
-	// 		}
-
-
-	// 	} else {
-	// 		//res := db.connect.Table("payment_receive").Create(map[string]interface{}{"trans_date": time.Now(), "journal_no": "xx", "status": 1, "company_id": company_id, "branch_id": branch_id})
-	// 		var payment = entity.PaymentMaster{
-	// 			Id:         0,
-	// 			TransDate:  time.Now(),
-	// 			CustomerId: customer_id,
-	// 			JournalNo:  db.GetPayLastNo(company_id, branch_id),
-	// 			Status:     1,
-	// 			CompanyId:  company_id,
-	// 			BranchId:   branch_id,
-	// 			CratedBy:   user_id,
-	// 			CreatedAt:  uint64(time.Now().Unix()),
-	// 			SlipDoc:    new_file,
-	// 		}
-	// 		if(new_file !=""){
-	// 			is_cash_transfer_payment = 4
-	// 		}
-	// 		if payment.JournalNo != "error na ja" {
-	// 			res := db.connect.Table("payment_receive").Create(&payment)
-	// 			if res.Error == nil {
-	// 				res_save_detail := db.connect.Table("payment_receive_line").Create(map[string]interface{}{"payment_receive_id": payment.Id, "order_id": order_id, "payment_amount": pay_amount, "payment_channel_id": is_cash_transfer_payment, "payment_method_id": payment_type_id, "status": 1, "payment_type_id": payment_type_id})
-	// 				if res_save_detail.Error == nil {
-	// 					print("create payment")
-	// 				}
-	// 			}
-	// 		}
-
-	// 	}
-
-	// } else {
-	// 	print("not have old payment data")
-	// }
+	
+	return nil
 }
 
 func sendFileToPHPServer(filename string) {
@@ -637,7 +598,7 @@ type MaxPayJournalNo struct {
 	JournalNo string `json:"journal_no"`
 }
 
-func (db *orderRepository) GetPayLastNo(company_id uint64, branch_id uint64) string {
+func (db *orderRepository) GetPayLastNo(tx *gorm.DB, company_id uint64, branch_id uint64) string {
 	var max_journal_no MaxPayJournalNo
 	var pre string = "AR-"
 	var prefix string = ""
@@ -647,12 +608,12 @@ func (db *orderRepository) GetPayLastNo(company_id uint64, branch_id uint64) str
 	// var prefix2 strings.Builder
 	current_date := time.Now().Local()
 
-	// row := db.connect.Table("payment_receive").Where("company_id=?", company_id).Where("branch_id=?", branch_id).Where("date(trans_date)=?", current_date.Format("2006-01-02")).Select("max(journal_no)").Row()
+	// row := tx.Table("payment_receive").Where("company_id=?", company_id).Where("branch_id=?", branch_id).Where("date(trans_date)=?", current_date.Format("2006-01-02")).Select("max(journal_no)").Row()
 	// err := row.Scan(&max_journal_no)
 	// if err != nil {
 	// 	return "error na ja"
 	// }
-	row := db.connect.Table("payment_receive").Where("company_id=?", company_id).Where("branch_id=?", branch_id).Where("date(trans_date)=?", current_date.Format("2006-01-02")).Select("id,journal_no").Last(&max_journal_no)
+	row := tx.Table("payment_receive").Where("company_id=?", company_id).Where("branch_id=?", branch_id).Where("date(trans_date)=?", current_date.Format("2006-01-02")).Select("id,journal_no").Last(&max_journal_no)
 	if row.Error != nil {
 		//panic(row.Error)
 		// if(row.Error.Error() == "record not found"){
